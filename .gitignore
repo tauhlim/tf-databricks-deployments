@@ -1,1 +1,4 @@
 variables.tf
+*lock*
+.terraform
+*tfstate*
