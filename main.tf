@@ -5,7 +5,6 @@ terraform {
     }
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 4.15.0"
     }
   }
 }
@@ -18,8 +17,13 @@ provider "aws" {
 provider "databricks" {
   alias    = "mws"
   host     = "https://accounts.cloud.databricks.com"
-  username = var.databricks_account_username
-  password = var.databricks_account_password
+  account_id = var.databricks_account_id
+}
+
+provider "databricks" {
+  alias    = "workspace_ops"
+  host     = databricks_mws_workspaces.this.workspace_url
+  profile = "DEFAULT"
 }
 
 /*
@@ -27,6 +31,10 @@ Create Cross-Account IAM Role
 */
 data "databricks_aws_assume_role_policy" "this" {
   external_id = var.databricks_account_id
+}
+
+data "aws_caller_identity" "current"{
+
 }
 
 resource "aws_iam_role" "cross_account_role" {
@@ -65,15 +73,18 @@ Create S3 Bucket
 
 resource "aws_s3_bucket" "root_storage_bucket" {
   bucket = var.root_bucket_name
-  acl    = "private"
-  versioning {
-    enabled = false
-  }
   force_destroy = true
   tags = merge(var.tags, {
     Name = var.root_bucket_name,
     Description = "Workspace Root Bucket for Databricks"
   })
+}
+
+resource "aws_s3_bucket_versioning" "root_storage_bucket" {
+  bucket = aws_s3_bucket.root_storage_bucket.id
+  versioning_configuration {
+    status = "Disabled"
+  }
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "root_storage_bucket" {
@@ -136,7 +147,8 @@ module "vpc" {
   tags = merge(var.tags, {Description = "VPC for Databricks Workspaces"})
 
   enable_dns_hostnames = true
-  enable_nat_gateway   = var.gateways.nat_gateway
+  # you can toggle everything below to false for no internet connectivity
+  enable_nat_gateway   = var.gateways.nat_gateway 
   single_nat_gateway   = var.gateways.single_nat
   create_igw           = var.gateways.igw
 
@@ -218,6 +230,16 @@ module "vpc_endpoints" {
         Description = "Endpoint for Data Plane to communicate with Kinesis"
       })
     },
+    glue = {
+      service             = "glue"
+      private_dns_enabled = true
+      subnet_ids          = module.vpc.private_subnets
+      security_group_ids = [module.vpc.default_security_group_id]
+      tags = merge(var.tags, {
+        Name = "${local.prefix}-glue-vpc-endpoint",
+        Description = "Endpoint for Data Plane to communicate with AWS Glue"
+      })
+    },
   }
 
   tags = var.tags
@@ -268,7 +290,7 @@ Create Security Group
 data "aws_subnet" "ws_vpc_subnets" {
   for_each = {
     private_subnet_1 = module.vpc.private_subnets[0], 
-    private_subnet_2 = module.vpc.private_subnets[1] # , 
+    private_subnet_2 = module.vpc.private_subnets[1]#, 
     # public_subnet = module.vpc.public_subnets[0]
     }
     id = each.value
@@ -321,50 +343,6 @@ resource "aws_security_group" "dataplane_vpce" {
     to_port     = 6666
     protocol    = "tcp"
     cidr_blocks = concat(local.vpce_cidr_block, local.vpc_cidr_blocks)
-  }
-
-  tags = merge(var.tags, {
-    Name = "${local.prefix}-${data.aws_vpc.prod.id}-pl-vpce-sg-rules"
-  })
-}
-
-resource "aws_security_group" "jph_security_group" {
-  name        = "Jumphost Security Group"
-  description = "Security Group for Jumphost resources. Generally used to test when public_access_enabled=FALSE"
-  vpc_id      = module.vpc.vpc_id
-
-  ingress {
-    description = "Inbound rules for SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.local_ip]
-
-  }
-
-  ingress {
-    description = "Inbound rules for RDP"
-    from_port   = 3389
-    to_port     = 3389
-    protocol    = "tcp"
-    cidr_blocks = [var.local_ip]
-
-  }
-
-  egress {
-    description = "Outbound rule to VPCE Subnet"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = concat(local.vpce_cidr_block)
-  }
-
-  egress {
-    description = "Outbound rule to VPCE Subnet"
-    from_port   = 6666
-    to_port     = 6666
-    protocol    = "tcp"
-    cidr_blocks = concat(local.vpce_cidr_block)
   }
 
   tags = merge(var.tags, {
@@ -464,4 +442,362 @@ resource "databricks_mws_workspaces" "this" {
   private_access_settings_id = databricks_mws_private_access_settings.pas.private_access_settings_id
   pricing_tier               = "ENTERPRISE"
   depends_on                 = [databricks_mws_networks.this]
+}
+
+/* Unity Catalog Initialization */
+
+resource "aws_s3_bucket" "metastore" {
+  bucket = "${local.prefix}-metastore"
+  force_destroy = true
+  tags = merge(var.tags, {
+    Name = "${local.prefix}-metastore"
+  })
+}
+
+resource "aws_s3_bucket_versioning" "metastore" {
+  bucket = aws_s3_bucket.metastore.id
+  versioning_configuration {
+    status = "Disabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "metastore" {
+  bucket = aws_s3_bucket.metastore.bucket
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "metastore" {
+  bucket                  = aws_s3_bucket.metastore.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+  depends_on              = [aws_s3_bucket.metastore]
+}
+
+data "aws_iam_policy_document" "passrole_for_uc" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+    principals {
+      identifiers = ["arn:aws:iam::414351767826:role/unity-catalog-prod-UCMasterRole-14S5ZJVKOTYTL"]
+      type        = "AWS"
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "sts:ExternalId"
+      values   = [var.databricks_account_id]
+    }
+  }
+  statement {
+    sid     = "ExplicitSelfRoleAssumption"
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+    condition {
+      test     = "ArnLike"
+      variable = "aws:PrincipalArn"
+      values   = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${local.prefix}-uc-access"]
+    }
+  }
+}
+
+resource "aws_iam_policy" "unity_metastore" {
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Id      = "${local.prefix}-databricks-unity-metastore"
+    Statement = [
+      {
+        "Action" : [
+          "s3:GetObject",
+          "s3:GetObjectVersion",
+          "s3:PutObject",
+          "s3:PutObjectAcl",
+          "s3:DeleteObject",
+          "s3:ListBucket",
+          "s3:GetBucketLocation"
+        ],
+        "Resource" : [
+          aws_s3_bucket.metastore.arn,
+          "${aws_s3_bucket.metastore.arn}/*"
+        ],
+        "Effect" : "Allow"
+      }
+    ]
+  })
+  tags = merge(var.tags, {
+    Name = "${local.prefix}-unity-catalog IAM policy"
+  })
+}
+
+resource "aws_iam_role" "metastore_data_access" {
+  name                = "${local.prefix}-uc-access"
+  assume_role_policy  = data.aws_iam_policy_document.passrole_for_uc.json
+  managed_policy_arns = [aws_iam_policy.unity_metastore.arn]
+  tags = merge(var.tags, {
+    Name = "${local.prefix}-unity-catalog IAM role"
+  })
+}
+
+# CREATE ADMIN GROUP
+
+data "databricks_service_principal" "me" {
+  provider = databricks.workspace_ops
+  application_id = var.databricks_service_principal_id
+}
+
+data "databricks_user" "account_owner" {
+  provider = databricks.mws
+  user_name = var.databricks_account_username
+}
+
+resource "databricks_group" "metastore_admins" {
+  provider     = databricks.mws
+  display_name = "metastore_admins"
+}
+
+resource "databricks_group_member" "metastore_admins" {
+  provider  = databricks.mws
+  for_each = toset([data.databricks_service_principal.me.id, data.databricks_user.account_owner.id])
+  group_id  = databricks_group.metastore_admins.id
+  member_id = each.value
+}
+
+resource "databricks_mws_permission_assignment" "add_user" {
+  provider = databricks.mws
+  workspace_id = databricks_mws_workspaces.this.workspace_id
+  principal_id = databricks_group.metastore_admins.id
+  permissions  = ["ADMIN"]
+  depends_on = [databricks_group.metastore_admins, databricks_metastore_assignment.default_metastore ]
+}
+
+resource "databricks_metastore" "this" {
+  provider      = databricks.workspace_ops
+  name          = "primary"
+  storage_root  = "s3://${aws_s3_bucket.metastore.id}/metastore"
+  owner         = databricks_group.metastore_admins.display_name
+  delta_sharing_scope = "INTERNAL_AND_EXTERNAL"
+  delta_sharing_recipient_token_lifetime_in_seconds = 604800
+  force_destroy = true
+  depends_on = [ databricks_mws_workspaces.this]
+}
+
+resource "databricks_metastore_assignment" "default_metastore" {
+  provider             = databricks.workspace_ops
+  workspace_id         = split("/", databricks_mws_workspaces.this.id)[1]
+  metastore_id         = databricks_metastore.this.id
+  default_catalog_name = "main"
+  depends_on = [ databricks_mws_workspaces.this ]
+}
+
+resource "databricks_metastore_data_access" "this" {
+  provider     = databricks.workspace_ops
+  metastore_id = databricks_metastore.this.id
+  name         = aws_iam_role.metastore_data_access.name
+  aws_iam_role {
+    role_arn = aws_iam_role.metastore_data_access.arn
+  }
+  is_default = true
+  depends_on = [ databricks_mws_workspaces.this, databricks_metastore_assignment.default_metastore ]
+}
+
+resource "aws_s3_bucket" "data_bucket" {
+  bucket = "${local.prefix}-data-bucket"
+  force_destroy = true
+  tags = merge(var.tags, {
+    Name = "${local.prefix}-data-bucket"
+  })
+}
+
+resource "aws_s3_bucket_versioning" "data_bucket" {
+  bucket = aws_s3_bucket.data_bucket.id
+  versioning_configuration {
+    status = "Disabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "data_bucket" {
+  bucket = aws_s3_bucket.data_bucket.bucket
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "external" {
+  bucket             = aws_s3_bucket.data_bucket.id
+  ignore_public_acls = true
+  depends_on         = [aws_s3_bucket.data_bucket]
+}
+
+resource "aws_s3_bucket_policy" "data_bucket_deny_except_select_traffic" {
+  bucket = aws_s3_bucket.data_bucket.id
+  policy = data.aws_iam_policy_document.data_bucket_deny_except_select_traffic.json
+}
+
+data "aws_iam_policy_document" "data_bucket_deny_except_select_traffic" {
+  statement {
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    effect = "Deny"
+
+    actions = [
+      "s3:GetObject",
+      "s3:GetBucketLocation"
+    ]
+
+    resources = [
+      aws_s3_bucket.data_bucket.arn,
+      "${aws_s3_bucket.data_bucket.arn}/*",
+    ]
+
+    condition {
+      test = "NotIpAddress"
+      variable = "aws:SourceIp"
+      values = [var.control_plane_nat_ip]
+    }
+
+    condition {
+      test = "StringNotEquals"
+      variable = "aws:SourceVpce"
+      values = [module.vpc_endpoints.endpoints.s3.id]
+    }
+  }
+}
+
+
+resource "aws_iam_policy" "ds_data_access" {
+  // Terraform's "jsonencode" function converts a
+  // Terraform expression's result to valid JSON syntax.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Id      = "${aws_s3_bucket.data_bucket.id}-access"
+    Statement = [
+      {
+        "Action" : [
+          "s3:GetObject",
+          "s3:GetObjectVersion",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:ListBucket",
+          "s3:GetBucketLocation",
+          "s3:GetLifecycleConfiguration",
+          "s3:PutLifecycleConfiguration"
+        ],
+        "Resource" : [
+          aws_s3_bucket.data_bucket.arn,
+          "${aws_s3_bucket.data_bucket.arn}/*"
+        ],
+        "Effect" : "Allow"
+      }
+    ]
+  })
+  tags = merge(var.tags, {
+    Name = "${local.prefix}-unity-catalog external access IAM policy"
+  })
+}
+
+data "aws_iam_policy_document" "passrole_for_external" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+    principals {
+      identifiers = ["arn:aws:iam::414351767826:role/unity-catalog-prod-UCMasterRole-14S5ZJVKOTYTL"]
+      type        = "AWS"
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "sts:ExternalId"
+      values   = [var.databricks_account_id]
+    }
+  }
+  statement {
+    sid     = "ExplicitSelfRoleAssumption"
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+    condition {
+      test     = "ArnLike"
+      variable = "aws:PrincipalArn"
+      values   = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${local.prefix}-external-access"]
+    }
+  }
+}
+
+
+resource "aws_iam_role" "ds_data_access" {
+  name                = "${local.prefix}-external-access"
+  assume_role_policy  = data.aws_iam_policy_document.passrole_for_external.json
+  managed_policy_arns = [aws_iam_policy.ds_data_access.arn]
+  tags = merge(var.tags, {
+    Name = "${local.prefix}-unity-catalog external access IAM role",
+    Comment = "This should work"
+  })
+}
+
+# Add Unity Catalog objects so we can create data assets to share
+
+resource "databricks_storage_credential" "external" {
+  provider = databricks.workspace_ops
+  name     = aws_iam_role.ds_data_access.name
+  aws_iam_role {
+    role_arn = aws_iam_role.ds_data_access.arn
+  }
+  depends_on = [ databricks_mws_workspaces.this, databricks_metastore_assignment.default_metastore ]
+}
+
+resource "databricks_external_location" "some" {
+  provider = databricks.workspace_ops
+  name            = "tau_external_location"
+  url             = "s3://${aws_s3_bucket.data_bucket.id}/external_location"
+  credential_name = databricks_storage_credential.external.id
+  depends_on = [ databricks_mws_workspaces.this, databricks_storage_credential.external ]
+}
+
+resource "databricks_catalog" "external" {
+  provider = databricks.workspace_ops
+  metastore_id = databricks_metastore.this.id
+  name         = "external"
+  comment      = "this catalog is managed by terraform"
+  storage_root = "${databricks_external_location.some.url}/external_catalog"
+  force_destroy = true
+  properties = {
+    purpose = "testing"
+  }
+}
+
+resource "databricks_schema" "external" {
+  provider           = databricks.workspace_ops
+  catalog_name = databricks_catalog.external.name
+  name         = "external"
+  comment      = "this database is managed by terraform"
+  force_destroy = true
+  properties = {
+    kind = "various"
+  }
+}
+
+resource "databricks_grants" "external" {
+  provider = databricks.workspace_ops
+  catalog = databricks_catalog.external.name
+  grant {
+    principal  = "metastore_admins"
+    privileges = ["USE_CATALOG", "USE_SCHEMA", "CREATE_TABLE"]
+  }
 }
