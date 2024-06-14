@@ -2,3 +2,4 @@ variables.tf
 *lock*
 .terraform
 *tfstate*
+.vscode/settings.json
